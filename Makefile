@@ -6,17 +6,20 @@ OUT = $(BUILD_DIR)/app
 
 CXX = g++-15
 CC = gcc-15
-CXXFLAGS = -std=c++17 -I../include
-LDFLAGS = -L$(BUILD_DIR) -lleveldb -lpthread
+APP_CXXFLAGS = -std=c++17 -I../include
+APP_LDFLAGS = -L$(BUILD_DIR) -lleveldb -lpthread
 
 build:
 	mkdir -p $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/CMakeCache.txt $(BUILD_DIR)/CMakeFiles
-	cd $(BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release -DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF -DCMAKE_C_STANDARD=17 -DCMAKE_CXX_STANDARD=17 -DCMAKE_C_COMPILER=$(CC) -DCMAKE_CXX_COMPILER=$(CXX) ..
+	cd $(BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_COMPILER=$(CXX) -DCMAKE_C_COMPILER=$(CC) -DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF ..
 	cd $(BUILD_DIR) && cmake --build . -j
 
-app: build
-	$(CXX) $(CXXFLAGS) $(SRC) $(LDFLAGS) -o $(OUT)
+sample.o: sample.cpp
+	$(CXX) $(APP_CXXFLAGS) sample.cpp -c sample.o
+
+app: build sample.o
+	$(CXX) $(APP_CXXFLAGS) sample.o $(APP_LDFLAGS) -o $(OUT)
 
 run: app
 	rm -rf /tmp/testdb
@@ -31,7 +34,7 @@ run: app
 strong_run: app
 	rm -rf /tmp/testdb
 	rm -f compaction_stats.txt
-	./$(OUT) out.txt
+	./$(OUT) out.txt > compaction_stats.txt
 	@ok=1; \
 	if diff -q ans.txt out.txt >/dev/null; then \
 		echo "Output check passed (out.txt matches ans.txt)"; \
