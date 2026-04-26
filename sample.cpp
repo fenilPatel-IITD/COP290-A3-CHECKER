@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -27,6 +28,56 @@ const char* DbPath() {
 int Fail(const char* what, const leveldb::Status& s) {
   std::cerr << "FAIL: " << what << ": " << s.ToString() << std::endl;
   return 1;
+}
+
+int Fail(const char* what) {
+  std::cerr << "FAIL: " << what << std::endl;
+  return 1;
+}
+
+// Expected [start_key, end_key) per LevelDB bytewise order — matches Iterator /
+// Get semantics for string keys in this harness.
+void ModelDeleteRangeInPlace(std::map<std::string, std::string>* m,
+                            const std::string& start_key,
+                            const std::string& end_key,
+                            std::vector<std::string>* removed_out) {
+  if (removed_out) {
+    removed_out->clear();
+  }
+  if (start_key >= end_key) {
+    return;
+  }
+  for (auto it = m->lower_bound(start_key);
+       it != m->end() && it->first < end_key;) {
+    if (removed_out) {
+      removed_out->push_back(it->first);
+    }
+    it = m->erase(it);
+  }
+}
+
+std::vector<std::pair<std::string, std::string>> ModelRangeScan(
+    const std::map<std::string, std::string>& m,
+    const std::string& start_key,
+    const std::string& end_key) {
+  std::vector<std::pair<std::string, std::string>> r;
+  if (start_key >= end_key) {
+    return r;
+  }
+  for (auto it = m.lower_bound(start_key);
+       it != m.end() && it->first < end_key; ++it) {
+    r.push_back({it->first, it->second});
+  }
+  return r;
+}
+
+bool IsStrictlySorted(const std::vector<std::pair<std::string, std::string>>& a) {
+  for (size_t i = 1; i < a.size(); ++i) {
+    if (a[i - 1].first >= a[i].first) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Deterministic checks matching clarifications: snapshot semantics, inverted
@@ -280,8 +331,9 @@ int main(int argc, char** argv) {
 
   constexpr unsigned kSeed = 67;
   constexpr int kNumOps = 10000;
-  // protocol=1: bump if deterministic prefix or line format changes.
-  out << "protocol=1 seed=" << kSeed << " ops=" << kNumOps << "\n";
+  // protocol=2: reference std::map cross-checks Get/Scan/DeleteRange (bump for
+  // line format or deterministic prefix changes only).
+  out << "protocol=2 seed=" << kSeed << " ops=" << kNumOps << "\n";
 
   int drc = RunDeterministic(db, out);
   if (drc != 0) {
@@ -289,6 +341,7 @@ int main(int argc, char** argv) {
     return drc;
   }
 
+  std::map<std::string, std::string> model; 
   std::mt19937 gen(kSeed);
   std::uniform_int_distribution<int> op_dist(0, 99);
   std::uniform_int_distribution<int> key_dist(1, 10000);
@@ -301,17 +354,32 @@ int main(int argc, char** argv) {
     std::string v = "value" + std::to_string(val_dist(gen));
 
     if (op < 50) {
-      status = db->Put(write_options, k1, v);
-      if (!status.ok()) {
-        return Fail("Put (random op)", status);
+      const leveldb::Status ps = db->Put(write_options, k1, v);
+      if (!ps.ok()) {
+        return Fail("Put (random op)", ps);
       }
+      std::string got;
+      const leveldb::Status gr = db->Get(read_options, k1, &got);
+      if (!gr.ok()) {
+        return Fail("Get after Put (read-your-writes)", gr);
+      }
+      if (got != v) {
+        return Fail("Get after Put: value mismatch");
+      }
+      model[k1] = v;
     } else if (op < 70) {
       std::string value;
       status = db->Get(read_options, k1, &value);
       if (status.ok()) {
+        const auto it = model.find(k1);
+        if (it == model.end() || it->second != value) {
+          return Fail("Get: value disagrees with reference model");
+        }
         out << "GET " << k1 << " => " << value << "\n";
       } else if (status.IsNotFound()) {
-        // ok, do not log
+        if (model.find(k1) != model.end()) {
+          return Fail("Get: NotFound but key exists in reference model");
+        }
       } else {
         return Fail("Get", status);
       }
@@ -320,27 +388,83 @@ int main(int argc, char** argv) {
       if (!status.ok()) {
         return Fail("Delete", status);
       }
+      {
+        std::string dummy;
+        const leveldb::Status g = db->Get(read_options, k1, &dummy);
+        if (!g.IsNotFound()) {
+          return Fail("Delete: key still visible to Get (expected NotFound)", g);
+        }
+      }
+      if (const auto it = model.find(k1); it != model.end()) {
+        model.erase(it);
+      }
     } else if (op < 95) {
       const std::string& start_key = std::min(k1, k2);
       const std::string& end_key = std::max(k1, k2);
+      const auto expected = ModelRangeScan(model, start_key, end_key);
       std::vector<std::pair<std::string, std::string>> scan_result;
       status = db->Scan(read_options, start_key, end_key, &scan_result);
       if (!status.ok()) {
         return Fail("Scan", status);
+      }
+      if (scan_result != expected) {
+        return Fail("Scan: result does not match reference [start,end) slice");
+      }
+      if (!IsStrictlySorted(scan_result)) {
+        return Fail("Scan: keys not strictly increasing");
+      }
+      for (const auto& p : scan_result) {
+        if (p.first < start_key || p.first >= end_key) {
+          return Fail("Scan: key outside [start, end) half-open range");
+        }
+        std::string g;
+        const leveldb::Status gs = db->Get(read_options, p.first, &g);
+        if (!gs.ok() || g != p.second) {
+          return Fail("Scan vs Get: pair must match Get(key)", gs);
+        }
       }
       out << "SCAN [" << start_key << ", " << end_key << ") size="
           << scan_result.size() << "\n";
     } else if (op < 99) {
       const std::string& start_key = std::min(k1, k2);
       const std::string& end_key = std::max(k1, k2);
+      std::vector<std::string> removed;
+      ModelDeleteRangeInPlace(&model, start_key, end_key, &removed);
       status = db->DeleteRange(write_options, start_key, end_key);
       if (!status.ok()) {
         return Fail("DeleteRange", status);
       }
+      for (const std::string& k : removed) {
+        std::string d;
+        const leveldb::Status dgs = db->Get(read_options, k, &d);
+        if (!dgs.IsNotFound()) {
+          return Fail("DeleteRange: in-range key still visible to Get (expected NotFound)", dgs);
+        }
+      }
     } else {
+      const size_t model_size_before = model.size();
       status = db->ForceFullCompaction();
       if (!status.ok()) {
         return Fail("ForceFullCompaction", status);
+      }
+      if (model.size() != model_size_before) {
+        return Fail("ForceFullCompaction: must not change logical keyspace");
+      }
+      for (int ss = 0; ss < 3; ++ss) {
+        const int probe = 1 + static_cast<int>((i * 1337u + ss * 1009u) % 10000u);
+        const std::string pk = "key" + std::to_string(probe);
+        std::string gv;
+        const leveldb::Status gs = db->Get(read_options, pk, &gv);
+        const auto mit = model.find(pk);
+        if (mit == model.end()) {
+          if (!gs.IsNotFound()) {
+            return Fail("After ForceFullCompaction: Get of absent key (model)", gs);
+          }
+        } else {
+          if (!gs.ok() || gv != mit->second) {
+            return Fail("After ForceFullCompaction: Get disagrees with model", gs);
+          }
+        }
       }
     }
   }

@@ -1,4 +1,4 @@
-protocol=1 seed=67 ops=10000
+protocol=2 seed=67 ops=10000
 DET scan_inverted 0
 DET scan_snapshot 1
 DET delrange_empty ok
