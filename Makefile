@@ -1,4 +1,7 @@
-# Local harness. Build libleveldb first: cmake -B build && cmake --build build -j
+# Local harness. Build libleveldb first, from repo root:
+#   cmake -B build -DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF -DLEVELDB_INSTALL=OFF
+#   cmake --build build -j
+# (If you have a full checkout with submodules, `cmake -B build && cmake --build build -j` is enough.)
 # Compiler must match the library. Override: make COP290_CXX=...  or  HOST_CXX=...
 BUILD_DIR       ?= ../build
 LEVELDB_LIB_DIR ?= $(BUILD_DIR)
@@ -16,7 +19,7 @@ LDFLAGS  += -L$(LEVELDB_LIB_DIR) -lleveldb -lpthread
 
 all: $(SAMPLE)
 
-$(SAMPLE): sample.cpp
+$(SAMPLE): sample.cpp $(LEVELDB_LIB_DIR)/libleveldb.a
 	$(LINK_CXX) $(CXXFLAGS) sample.cpp -o $(SAMPLE) $(LDFLAGS)
 
 help:

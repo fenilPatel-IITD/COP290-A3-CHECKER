@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -285,6 +286,225 @@ int RunConcurrentRaceTest(bool emit_race_line) {
   return 0;
 }
 
+// One thread runs ForceFullCompaction; worker threads interleave other DB
+// calls with that compaction (concurrency is between compaction and user ops).
+// A mutex serializes *workers only* (shared reference model) so checks stay
+// consistent; compaction runs without holding it. Verifies liveness: every
+// operation completes with OK/NotFound as appropriate, and the DB matches the
+// model afterward (not a proof of a particular blocking order).
+const char* CompactionTestDbPath() {
+  const char* p = std::getenv("COP290_COMPACTION_DB");
+  return (p && p[0]) ? p : "/tmp/testdb_compaction";
+}
+
+int RunCompactionOverlapTest(bool emit_line) {
+  {
+    const std::string rmcmd =
+        std::string("rm -rf '") + std::string(CompactionTestDbPath()) + "'";
+    std::system(rmcmd.c_str());
+  }
+  leveldb::DB* db = nullptr;
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::Status ostatus = leveldb::DB::Open(options, CompactionTestDbPath(), &db);
+  if (!ostatus.ok() || !db) {
+    std::cerr << "COMPACT: open: " << ostatus.ToString() << std::endl;
+    return 1;
+  }
+
+  std::map<std::string, std::string> model;
+  std::mutex wmu;  // worker model + all worker DB access (keeps model exact)
+  leveldb::WriteOptions wo;
+  leveldb::ReadOptions ro;
+
+  int prefill = 30000;
+  if (const char* e = std::getenv("COP290_COMPACTION_PREFILL")) {
+    prefill = std::max(2000, std::atoi(e));
+  }
+  for (int i = 0; i < prefill; ++i) {
+    const std::string k = "pre_" + std::to_string(i);
+    const std::string v = "v_" + std::to_string(i);
+    const leveldb::Status ps = db->Put(wo, k, v);
+    if (!ps.ok()) {
+      std::cerr << "COMPACT: prefill: " << ps.ToString() << std::endl;
+      delete db;
+      return 1;
+    }
+    model[k] = v;
+  }
+
+  int n_workers = 4;
+  int ops_each = 5000;
+  if (const char* t = std::getenv("COP290_COMPACTION_WORKERS")) {
+    n_workers = std::max(1, std::atoi(t));
+  }
+  if (const char* o = std::getenv("COP290_COMPACTION_OPS")) {
+    ops_each = std::max(500, std::atoi(o));
+  }
+
+  std::atomic<bool> failed{false};
+
+  std::thread compact_thread([db, &failed]() {
+    const leveldb::Status s = db->ForceFullCompaction();
+    if (!s.ok()) {
+      std::cerr << "COMPACT: ForceFullCompaction: " << s.ToString() << std::endl;
+      failed.store(true);
+    }
+  });
+
+  std::vector<std::thread> workers;
+  for (int tid = 0; tid < n_workers; ++tid) {
+    workers.emplace_back([db, n_workers, ops_each, prefill, tid, &model, &wmu, &wo,
+                          &ro, &failed]() {
+      std::mt19937 gen(91u + 1009u * static_cast<unsigned>(tid) +
+                       3u * static_cast<unsigned>(n_workers));
+      const std::string pfx = "w" + std::to_string(tid) + "_";
+      for (int i = 0; i < ops_each; ++i) {
+        if (failed.load()) {
+          return;
+        }
+        const int op = UniformInRange(gen, 0, 99);
+        const int ki = UniformInRange(gen, 0, prefill - 1);
+        const int kj = UniformInRange(gen, 0, prefill - 1);
+        std::string a = "pre_" + std::to_string(ki);
+        std::string b = "pre_" + std::to_string(kj);
+        if (a > b) {
+          std::swap(a, b);
+        }
+        const std::string wk =
+            pfx + "k" + std::to_string(UniformInRange(gen, 0, 5000));
+        const std::string wv =
+            pfx + "v" + std::to_string(UniformInRange(gen, 1, 100000));
+
+        std::lock_guard<std::mutex> lock(wmu);
+        if (failed.load()) {
+          return;
+        }
+        leveldb::Status s;
+        if (op < 38) {
+          s = db->Put(wo, wk, wv);
+          if (!s.ok()) {
+            failed.store(true);
+            return;
+          }
+          model[wk] = wv;
+        } else if (op < 62) {
+          std::string g;
+          s = db->Get(ro, wk, &g);
+          if (s.IsNotFound()) {
+            if (model.find(wk) != model.end()) {
+              failed.store(true);
+            } else {
+              continue;
+            }
+            return;
+          }
+          if (!s.ok()) {
+            failed.store(true);
+            return;
+          }
+          const auto it = model.find(wk);
+          if (it == model.end() || it->second != g) {
+            failed.store(true);
+            return;
+          }
+        } else if (op < 72) {
+          s = db->Delete(wo, wk);
+          if (!s.ok()) {
+            failed.store(true);
+            return;
+          }
+          const auto it = model.find(wk);
+          if (it != model.end()) {
+            model.erase(it);
+          }
+        } else if (op < 88) {
+          if (a < b) {
+            const auto exp = ModelRangeScan(model, a, b);
+            std::vector<std::pair<std::string, std::string>> r;
+            s = db->Scan(ro, a, b, &r);
+            if (!s.ok() || r != exp || !IsStrictlySorted(r)) {
+              failed.store(true);
+              return;
+            }
+            for (const auto& p : r) {
+              if (p.first < a || p.first >= b) {
+                failed.store(true);
+                return;
+              }
+            }
+          }
+        } else if (op < 98) {
+          if (a < b) {
+            std::vector<std::string> removed;
+            ModelDeleteRangeInPlace(&model, a, b, &removed);
+            s = db->DeleteRange(wo, a, b);
+            if (!s.ok()) {
+              failed.store(true);
+              return;
+            }
+            for (const std::string& kx : removed) {
+              std::string d;
+              if (!db->Get(ro, kx, &d).IsNotFound()) {
+                failed.store(true);
+                return;
+              }
+            }
+          }
+        } else {
+          std::string g;
+          s = db->Get(ro, a, &g);
+          if (s.IsNotFound()) {
+            if (model.find(a) != model.end()) {
+              failed.store(true);
+            } else {
+              continue;
+            }
+            return;
+          }
+          if (!s.ok()) {
+            failed.store(true);
+            return;
+          }
+          const auto it = model.find(a);
+          if (it == model.end() || it->second != g) {
+            failed.store(true);
+            return;
+          }
+        }
+      }
+    });
+  }
+
+  for (auto& w : workers) {
+    w.join();
+  }
+  compact_thread.join();
+
+  if (failed.load()) {
+    delete db;
+    return 1;
+  }
+  for (const auto& p : model) {
+    std::string g;
+    const leveldb::Status s = db->Get(ro, p.first, &g);
+    if (!s.ok() || g != p.second) {
+      std::cerr << "COMPACT: final check failed: key=" << p.first << " "
+                << s.ToString() << std::endl;
+      delete db;
+      return 1;
+    }
+  }
+
+  delete db;
+  if (emit_line) {
+    std::cout << "COMPACT: ok prefill=" << prefill
+              << " workers=" << n_workers << " ops_each=" << ops_each
+              << std::endl;
+  }
+  return 0;
+}
+
 }  // namespace
 
 namespace {
@@ -303,15 +523,23 @@ int main(int argc, char** argv) {
     std::cout << "ST: skip" << std::endl;
     return RunConcurrentRaceTest(true);
   }
+  if (ArgMatch(argc, argv, "--compaction-only")) {
+    std::cout << "ST: skip" << std::endl;
+    std::cout << "RACE: skip" << std::endl;
+    return RunCompactionOverlapTest(true);
+  }
   if (ArgMatch(argc, argv, "--help") || ArgMatch(argc, argv, "-h")) {
     std::cout
-        << "usage: sample [--write] [--concurrent] [--race-only] [--help]\n"
+        << "usage: sample [--write] [--concurrent] [--race-only] "
+           "[--compaction-only] [--help]\n"
         << "  (default)     single-threaded workload -> out.txt\n"
         << "  --write       write ans.txt (for update_golden)\n"
-        << "  --concurrent  after ST run, also run multi-threaded RACE on "
-           "COP290_RACE_DB (default /tmp/testdb_race)\n"
+        << "  --concurrent  after ST run, also RACE then ForceFullCompaction "
+           "overlap test (separate DBs: COP290_RACE_DB, COP290_COMPACTION_DB)\n"
         << "  --race-only   only the concurrent stress (no out.txt; for "
-           "make race)\n";
+           "make race)\n"
+        << "  --compaction-only  only overlap test (one thread compacts, "
+           "others Put/Get/…; COP290_COMPACTION_DB)\n";
     return 0;
   }
 
@@ -499,6 +727,10 @@ int main(int argc, char** argv) {
     const int rrc = RunConcurrentRaceTest(false);
     if (rrc != 0) {
       return rrc;
+    }
+    const int crc = RunCompactionOverlapTest(false);
+    if (crc != 0) {
+      return crc;
     }
     std::cout << "ST: OK" << std::endl;
     std::cout << "RACE: OK" << std::endl;
